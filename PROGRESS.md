@@ -1,6 +1,7 @@
 # Build Log — FastAPI Docs RAG + Eval Harness
 
 Running log of decisions, steps, and issues for this project. Updated as we go.
+See `RESOURCES.md` for the research papers and engineering write-ups backing these decisions.
 
 ## Goal
 
@@ -56,7 +57,8 @@ demo. See `README.md` for the pitch and setup instructions.
 3. Embed + index corpus into Qdrant
 4. Build golden dataset file
 5. Smoke-test the RAG pipeline on a sample question
-6. Run the DeepEval harness, review scores
-7. Iterate on chunking/retrieval based on what the metrics show
-8. Wire up Phoenix tracing for a debugging demo
-9. Stretch: CI workflow running `run_deepeval.py` as a regression gate; deploy the FastAPI app
+6. Run the DeepEval harness, review scores (this becomes the "v1 baseline")
+7. Implement Anthropic's Contextual Retrieval in `chunk.py` (prepend LLM-generated context to each chunk before embedding) — re-run eval, compare scores as a v1→v2 ablation ([RESOURCES.md](RESOURCES.md))
+8. Fix context ordering in `generator.py` per the Lost-in-the-Middle finding (most relevant chunks first *and* last, not buried in the middle)
+9. Wire up Phoenix tracing for a debugging demo
+10. Stretch: AutoRAG-style sweep over chunk size/top_k picked by eval score; CI workflow running `run_deepeval.py` as a regression gate; deploy the FastAPI app

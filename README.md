@@ -7,6 +7,9 @@ a golden dataset built from real, answered GitHub Discussions.
 **Stack:** Qdrant (vector store) · OpenAI (`text-embedding-3-small` + `gpt-4o-mini`) ·
 DeepEval (metrics/CI) · Arize Phoenix (tracing) · FastAPI (serving)
 
+See [`PROGRESS.md`](PROGRESS.md) for the build log and [`RESOURCES.md`](RESOURCES.md)
+for the research papers and techniques this design is based on.
+
 ## Why this project
 
 Most portfolio RAG projects are "chatbot over a PDF" with no way to know if it
