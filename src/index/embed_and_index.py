@@ -31,6 +31,7 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -125,7 +126,9 @@ def make_batches(chunks: list, start_index: int, end_index: int) -> list[tuple[i
 def embed_batch(genai_client: genai.Client, texts: list[str]) -> list[list[float]]:
     """One request = one batchEmbedContents call. On 429, sleep past the quota
     window and retry a few times rather than hammering it with exponential backoff
-    (which just burns more of the same per-minute quota)."""
+    (which just burns more of the same per-minute quota). Also retries on transient
+    network/DNS failures (httpx.ConnectError etc.) - an internet blip shouldn't
+    kill a multi-hour unattended job."""
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         try:
             resp = genai_client.models.embed_content(
@@ -139,6 +142,13 @@ def embed_batch(genai_client: genai.Client, texts: list[str]) -> list[list[float
                 print(f"\nRate limited, sleeping {RATE_LIMIT_BACKOFF_SECONDS}s before retry...")
                 time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
                 continue
+            raise
+        except httpx.ConnectError as e:
+            if attempt < RATE_LIMIT_RETRIES:
+                print(f"\nNetwork error ({e}), sleeping 30s before retry...")
+                time.sleep(30)
+                continue
+            raise
             raise
 
 

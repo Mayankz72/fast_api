@@ -28,6 +28,8 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
+
 # Some judge responses (larger retrieval contexts) exceed DeepEval's default ~88s
 # per-attempt timeout - must be set before deepeval reads its settings.
 os.environ.setdefault("DEEPEVAL_PER_ATTEMPT_TIMEOUT_SECONDS_OVERRIDE", "180")
@@ -107,6 +109,20 @@ def next_unscored_batch(golden: list[dict], already_scored: set[str], batch_size
     return [item for item in golden if item["question"] not in already_scored][:batch_size]
 
 
+def run_pipeline_with_backoff(pipeline: RAGPipeline, question: str):
+    """A brief internet blip shouldn't kill an unattended run - retry a few times
+    on transient network failures before giving up."""
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        try:
+            return pipeline.run(question)
+        except httpx.ConnectError as e:
+            if attempt < RATE_LIMIT_RETRIES:
+                print(f"  network error ({e}), sleeping 30s before retry...")
+                time.sleep(30)
+                continue
+            raise
+
+
 def measure_with_backoff(metric, test_case: LLMTestCase) -> None:
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         try:
@@ -127,6 +143,12 @@ def measure_with_backoff(metric, test_case: LLMTestCase) -> None:
                 print("  request timed out, retrying...")
                 continue
             raise
+        except httpx.ConnectError as e:
+            if attempt < RATE_LIMIT_RETRIES:
+                print(f"  network error ({e}), sleeping 30s before retry...")
+                time.sleep(30)
+                continue
+            raise
 
 
 def main(batch_size: int = 2) -> None:
@@ -144,7 +166,7 @@ def main(batch_size: int = 2) -> None:
           f"({len(already_scored)}/{len(golden)} already scored so far)...")
     test_cases = []
     for item in batch:
-        result = pipeline.run(item["question"])
+        result = run_pipeline_with_backoff(pipeline, item["question"])
         test_cases.append(
             LLMTestCase(
                 input=item["question"],
