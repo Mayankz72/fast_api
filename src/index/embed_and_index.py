@@ -1,8 +1,8 @@
-"""Embed all chunks and load them into Qdrant.
+"""Embed corpus chunks and load them into Qdrant.
 
-Resumable: progress is checkpointed to CHECKPOINT_PATH after every successful batch,
-so re-running after a rate-limit/quota error picks up where it left off instead of
-re-embedding (and re-spending free-tier quota on) chunks already indexed.
+Resumable: progress is checkpointed after every successful batch, so re-running
+after a rate-limit/quota error picks up where it left off instead of re-embedding
+(and re-spending free-tier quota on) chunks already indexed.
 
 Batches are sized by character budget, not a fixed chunk count: the free tier's real
 constraint (confirmed empirically) is ~1000 *tokens* per minute for this model, not
@@ -10,7 +10,21 @@ request count, and chunk lengths vary a lot (some are 20 chars, some 2000+), so 
 fixed-count batch can randomly land on several long chunks and blow the budget. At
 this rate, indexing the full corpus takes several hours - that's the accepted
 tradeoff for a $0 pipeline (see PROGRESS.md).
+
+Supports running multiple workers in parallel, each on a different chunk range and
+a different account's API key, to split the backlog and finish faster - e.g.:
+
+    python src/index/embed_and_index.py --start 1341 --end 2086 \
+        --checkpoint data/processed/embed_checkpoint_a.json --api-key-env GEMINI_API_KEY_EMBED
+    python src/index/embed_and_index.py --start 2086 --end 2832 \
+        --checkpoint data/processed/embed_checkpoint_b.json --api-key-env GEMINI_API_KEY_EMBED_2
+
+Each worker's checkpoint tracks its own range independently; they upsert into the
+same Qdrant collection (safe - point IDs are the chunk's absolute corpus index, so
+ranges never collide). With no arguments, behaves as a single full-range worker
+using the default checkpoint file, same as before.
 """
+import argparse
 import json
 import os
 import sys
@@ -40,34 +54,46 @@ RATE_LIMIT_BACKOFF_SECONDS = 70
 
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 COLLECTION = os.environ.get("QDRANT_COLLECTION", "fastapi_corpus")
-CHECKPOINT_PATH = Path(__file__).resolve().parents[2] / "data" / "processed" / "embed_checkpoint.json"
+DEFAULT_CHECKPOINT_PATH = Path(__file__).resolve().parents[2] / "data" / "processed" / "embed_checkpoint.json"
 
 
-def get_clients() -> tuple[genai.Client, QdrantClient]:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", type=int, default=0, help="First chunk index to process (inclusive)")
+    parser.add_argument("--end", type=int, default=None, help="Last chunk index to process (exclusive); default = end of corpus")
+    parser.add_argument("--checkpoint", type=str, default=str(DEFAULT_CHECKPOINT_PATH), help="Path to this worker's checkpoint file")
+    parser.add_argument("--api-key-env", type=str, default="GEMINI_API_KEY_EMBED", help="Env var name holding the API key to use")
+    return parser.parse_args()
+
+
+def get_clients(api_key_env: str) -> tuple[genai.Client, QdrantClient]:
     # attempts=1 disables the SDK's own silent internal retry-on-429, so every
     # HTTP request we make is visible and accounted for in our own pacing/backoff.
     genai_client = genai.Client(
-        api_key=os.environ.get("GEMINI_API_KEY_EMBED", os.environ["GEMINI_API_KEY"]),
+        api_key=os.environ.get(api_key_env, os.environ["GEMINI_API_KEY"]),
         http_options=HttpOptions(retry_options=HttpRetryOptions(attempts=1)),
     )
     qdrant_client = QdrantClient(url=QDRANT_URL)
     return genai_client, qdrant_client
 
 
-def load_checkpoint() -> int:
-    if CHECKPOINT_PATH.exists():
-        return json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))["next_index"]
-    return 0
+def load_checkpoint(checkpoint_path: Path, range_start: int) -> int:
+    if checkpoint_path.exists():
+        return json.loads(checkpoint_path.read_text(encoding="utf-8"))["next_index"]
+    return range_start
 
 
-def save_checkpoint(next_index: int) -> None:
-    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CHECKPOINT_PATH.write_text(json.dumps({"next_index": next_index}), encoding="utf-8")
+def save_checkpoint(checkpoint_path: Path, next_index: int) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(json.dumps({"next_index": next_index}), encoding="utf-8")
 
 
-def ensure_collection(qdrant: QdrantClient, fresh_start: bool) -> None:
+def ensure_collection(qdrant: QdrantClient, want_fresh_start: bool) -> None:
     exists = qdrant.collection_exists(COLLECTION)
-    if fresh_start and exists:
+    current_count = qdrant.count(COLLECTION).count if exists else 0
+    # Only ever wipe a collection that's actually empty - protects against a
+    # parallel worker's fresh checkpoint wiping data another worker already wrote.
+    if want_fresh_start and exists and current_count == 0:
         qdrant.delete_collection(COLLECTION)
         exists = False
     if not exists:
@@ -77,18 +103,17 @@ def ensure_collection(qdrant: QdrantClient, fresh_start: bool) -> None:
         )
 
 
-def make_batches(chunks: list, start_index: int) -> list[tuple[int, list]]:
-    """Group chunks[start_index:] into (start_offset, batch) pairs, each batch
-    capped at CHAR_BUDGET_PER_BATCH total characters (at least one chunk per batch,
-    even if that single chunk alone exceeds the budget)."""
+def make_batches(chunks: list, start_index: int, end_index: int) -> list[tuple[int, list]]:
+    """Group chunks[start_index:end_index] into (start_offset, batch) pairs, each
+    batch capped at CHAR_BUDGET_PER_BATCH total characters (at least one chunk per
+    batch, even if that single chunk alone exceeds the budget)."""
     batches = []
     i = start_index
-    n = len(chunks)
-    while i < n:
+    while i < end_index:
         batch = [chunks[i]]
         total_chars = len(chunks[i].text)
         j = i + 1
-        while j < n and total_chars + len(chunks[j].text) <= CHAR_BUDGET_PER_BATCH:
+        while j < end_index and total_chars + len(chunks[j].text) <= CHAR_BUDGET_PER_BATCH:
             batch.append(chunks[j])
             total_chars += len(chunks[j].text)
             j += 1
@@ -118,18 +143,26 @@ def embed_batch(genai_client: genai.Client, texts: list[str]) -> list[list[float
 
 
 def main() -> None:
+    args = parse_args()
+    checkpoint_path = Path(args.checkpoint)
+
     root = Path(__file__).resolve().parents[2] / "data" / "raw"
     chunks = chunk_corpus(root / "docs", root / "code")
-    print(f"Loaded {len(chunks)} chunks to index")
+    range_end = args.end if args.end is not None else len(chunks)
+    print(f"Loaded {len(chunks)} chunks total; this worker handles [{args.start}, {range_end})")
 
-    start_index = load_checkpoint()
-    genai_client, qdrant_client = get_clients()
-    ensure_collection(qdrant_client, fresh_start=(start_index == 0))
+    start_index = load_checkpoint(checkpoint_path, args.start)
+    genai_client, qdrant_client = get_clients(args.api_key_env)
+    ensure_collection(qdrant_client, want_fresh_start=(args.start == 0 and start_index == 0))
 
-    if start_index:
+    if start_index > args.start:
         print(f"Resuming from chunk {start_index} (checkpoint found)")
 
-    batches = make_batches(chunks, start_index)
+    if start_index >= range_end:
+        print("This worker's range is already fully indexed - nothing to do.")
+        return
+
+    batches = make_batches(chunks, start_index, range_end)
 
     try:
         for offset, batch in tqdm(batches, desc="Embedding + upserting"):
@@ -148,7 +181,7 @@ def main() -> None:
                 for j, (c, vec) in enumerate(zip(batch, vectors))
             ]
             qdrant_client.upsert(collection_name=COLLECTION, points=points)
-            save_checkpoint(offset + len(batch))
+            save_checkpoint(checkpoint_path, offset + len(batch))
             time.sleep(REQUEST_PACING_SECONDS)
     except ClientError as e:
         if e.code == 429:
@@ -160,8 +193,8 @@ def main() -> None:
         raise
 
     count = qdrant_client.count(COLLECTION).count
-    print(f"Indexed {count} points into Qdrant collection '{COLLECTION}'")
-    CHECKPOINT_PATH.unlink(missing_ok=True)
+    print(f"This worker's range done. Collection '{COLLECTION}' now has {count} points total.")
+    checkpoint_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
