@@ -1,4 +1,4 @@
-"""Wire OpenAI calls up to a local Phoenix server (run via `docker compose up -d phoenix`).
+"""Wire Gemini calls up to a local Phoenix server (run via `docker compose up -d phoenix`).
 
 Phoenix runs as its own container (see docker-compose.yml) — this module only needs
 the lightweight OpenTelemetry SDK + OpenInference instrumentation to export traces
@@ -7,7 +7,7 @@ dependency tree) into the app's own environment.
 
 UI: http://localhost:6006
 """
-from openinference.instrumentation.openai import OpenAIInstrumentor
+from openinference.instrumentation.google_genai import GoogleGenAIInstrumentor
 from openinference.semconv.resource import ResourceAttributes
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -29,7 +29,7 @@ def start_tracing() -> None:
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=PHOENIX_OTLP_ENDPOINT)))
     trace.set_tracer_provider(provider)
-    OpenAIInstrumentor().instrument(tracer_provider=provider)
+    GoogleGenAIInstrumentor().instrument(tracer_provider=provider)
     _instrumented = True
     print(f"Tracing to Phoenix at {PHOENIX_OTLP_ENDPOINT} (UI: http://localhost:6006)")
 
