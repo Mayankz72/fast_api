@@ -6,13 +6,16 @@ Metrics:
 - Contextual Precision: are the most relevant chunks ranked first?
 - Contextual Recall: does retrieved context cover what the ground-truth answer needs?
 
-Every free-tier Gemini chat model on this account caps at ~20 generate_content
-calls/day (confirmed on gemini-3.5-flash and gemini-3.6-flash alike - looks like an
-account-wide limit, not model-specific). With 4 metrics x ~1-2 judge calls each,
-that's only ~2 golden examples/day against a single model. So this runs a small
-daily batch and *appends* to the existing report rather than overwriting, picking
-up the next unscored golden examples each time - the eval set builds up slowly
-across days instead of trying (and failing) to score everything in one run.
+Every free-tier Gemini chat model has its own daily generate_content quota, varying
+by model (as low as 20/day, as high as 500/day - discovered empirically, no
+documented pattern). With 4 metrics x ~1-2 judge calls each, a single model's quota
+only covers a handful to a few dozen golden examples/day. Rather than stopping for
+the day once one model runs dry, JUDGE_MODEL_CANDIDATES is tried in order and
+whichever one still has quota is used - so the loop keeps making progress on a
+single day using multiple models' quotas back to back. This runs a small batch per
+invocation and *appends* to the existing report rather than overwriting, picking up
+the next unscored golden examples each time - the eval set builds up over multiple
+runs instead of trying (and failing) to score everything in one run.
 
 DeepEval's evaluate() also fires all metrics for a test case concurrently via
 asyncio.gather regardless of async_config (that setting only paces *between* test
@@ -37,6 +40,7 @@ from deepeval.metrics import (
 )
 from deepeval.models import GeminiModel
 from deepeval.test_case import LLMTestCase
+from google import genai
 from google.genai.errors import APIError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -48,10 +52,45 @@ REPORT_PATH = Path(__file__).resolve().parents[2] / "data" / "processed" / "eval
 METRIC_PACING_SECONDS = 20.0
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_SECONDS = 65
-# gemini-3.5-flash and gemini-3.6-flash both already exhausted for today (see
-# module docstring) - gemini-3.1-flash-lite is untouched so far; stick with one
-# model long-term so results are judged consistently across days.
-JUDGE_MODEL = "gemini-3.1-flash-lite"
+# Each model has its own separate daily quota (some as low as 20/day, some as high
+# as 500/day - varies by model, discovered empirically, see PROGRESS.md). Rather
+# than manually swapping JUDGE_MODEL every time the current one runs dry, try this
+# list in order and use whichever one still has quota today - keeps the eval loop
+# going instead of stopping for the day just because one specific model is tapped.
+JUDGE_MODEL_CANDIDATES = [
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-flash-lite-latest",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+]
+
+
+def build_metrics_with_available_judge(probe_client: genai.Client, remaining_candidates: list[str]):
+    """Pop exhausted/unavailable models off the front of remaining_candidates until
+    one responds, and build the metrics list against it. Returns None if every
+    candidate is exhausted."""
+    while remaining_candidates:
+        model = remaining_candidates[0]
+        try:
+            probe_client.models.generate_content(model=model, contents="OK")
+        except APIError as e:
+            if e.code in (429, 404, 503):
+                print(f"  judge model {model} unavailable ({e.code}), trying next candidate...")
+                remaining_candidates.pop(0)
+                continue
+            raise
+        print(f"Using judge model: {model}")
+        judge = GeminiModel(model=model, api_key=os.environ["GEMINI_API_KEY"])
+        return [
+            FaithfulnessMetric(threshold=0.7, model=judge),
+            AnswerRelevancyMetric(threshold=0.7, model=judge),
+            ContextualPrecisionMetric(threshold=0.7, model=judge),
+            ContextualRecallMetric(threshold=0.7, model=judge),
+        ]
+    return None
 
 
 def load_golden() -> list[dict]:
@@ -115,53 +154,63 @@ def main(batch_size: int = 2) -> None:
             )
         )
 
-    judge = GeminiModel(model=JUDGE_MODEL, api_key=os.environ["GEMINI_API_KEY"])
-    metrics = [
-        FaithfulnessMetric(threshold=0.7, model=judge),
-        AnswerRelevancyMetric(threshold=0.7, model=judge),
-        ContextualPrecisionMetric(threshold=0.7, model=judge),
-        ContextualRecallMetric(threshold=0.7, model=judge),
-    ]
+    probe_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    remaining_candidates = list(JUDGE_MODEL_CANDIDATES)
+    metrics = build_metrics_with_available_judge(probe_client, remaining_candidates)
+    if metrics is None:
+        print("All candidate judge models exhausted or unavailable for today.")
+        sys.exit(1)
 
     report = existing_report
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     for i, test_case in enumerate(test_cases):
         print(f"Scoring test case {i + 1}/{len(test_cases)}: {test_case.input[:60]!r}")
-        metrics_data = []
-        try:
-            for metric in metrics:
-                measure_with_backoff(metric, test_case)
-                metrics_data.append(
+        while True:
+            try:
+                metrics_data = []
+                for metric in metrics:
+                    measure_with_backoff(metric, test_case)
+                    metrics_data.append(
+                        {
+                            "name": metric.__name__,
+                            "score": metric.score,
+                            "success": metric.is_successful(),
+                            "reason": metric.reason,
+                        }
+                    )
+                    time.sleep(METRIC_PACING_SECONDS)
+                report.append(
                     {
-                        "name": metric.__name__,
-                        "score": metric.score,
-                        "success": metric.is_successful(),
-                        "reason": metric.reason,
+                        "input": test_case.input,
+                        "success": all(m["success"] for m in metrics_data),
+                        "metrics": metrics_data,
                     }
                 )
-                time.sleep(METRIC_PACING_SECONDS)
-            report.append(
-                {
-                    "input": test_case.input,
-                    "success": all(m["success"] for m in metrics_data),
-                    "metrics": metrics_data,
-                }
-            )
-        except APIError as e:
-            if e.code in (429, 503):
-                # Quota/overload exhausted for the day - stop the whole run, don't
-                # mark this example as scored so it's retried fresh next time.
-                REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
-                raise
-            # Some other API error - record it as an error entry so this example
-            # doesn't get retried forever, and move on to the next one.
-            report.append({"input": test_case.input, "success": False, "error": str(e)})
-        except Exception as e:
-            # Anything else non-quota (timeouts, the judge model returning
-            # malformed JSON for a tricky example, etc.) - one bad example
-            # shouldn't block the whole batch. Record and move on.
-            print(f"  error scoring this example, skipping: {e}")
-            report.append({"input": test_case.input, "success": False, "error": str(e)})
+                break
+            except APIError as e:
+                if e.code in (429, 503):
+                    # This judge model is done for today - swap to the next
+                    # candidate and retry this same example, rather than
+                    # stopping the whole run over one exhausted model.
+                    print(f"  judge model exhausted ({e.code}), switching candidates...")
+                    remaining_candidates.pop(0)
+                    metrics = build_metrics_with_available_judge(probe_client, remaining_candidates)
+                    if metrics is None:
+                        print("All candidate judge models exhausted or unavailable for today.")
+                        REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                        sys.exit(1)
+                    continue
+                # Some other API error - record it as an error entry so this
+                # example doesn't get retried forever, and move on.
+                report.append({"input": test_case.input, "success": False, "error": str(e)})
+                break
+            except Exception as e:
+                # Anything else non-quota (timeouts, the judge model returning
+                # malformed JSON for a tricky example, etc.) - one bad example
+                # shouldn't block the whole batch. Record and move on.
+                print(f"  error scoring this example, skipping: {e}")
+                report.append({"input": test_case.input, "success": False, "error": str(e)})
+                break
         # Save after every test case, not just at the end - a later test case
         # hitting the daily quota wall shouldn't lose already-scored results.
         REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
