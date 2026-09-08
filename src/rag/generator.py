@@ -32,9 +32,29 @@ If the context doesn't contain enough information to answer, say so explicitly i
 of guessing or using outside knowledge."""
 
 
+def reorder_lost_in_middle(chunks: list[dict]) -> list[dict]:
+    """Chunks arrive ranked most-relevant-first from retrieval. LLMs attend best to
+    the start and end of their context and worst to the middle (the "lost in the
+    middle" effect, see RESOURCES.md), so interleave from both ends inward instead:
+    highest-ranked chunk first, second-highest last, third-highest second, etc.
+    Only reorders what the model sees for generation - callers that need retrieval
+    ranking order (citations, eval's contextual-precision/recall metrics) should
+    keep using the original chunks list."""
+    reordered = [None] * len(chunks)
+    left, right = 0, len(chunks) - 1
+    for i, chunk in enumerate(chunks):
+        if i % 2 == 0:
+            reordered[left] = chunk
+            left += 1
+        else:
+            reordered[right] = chunk
+            right -= 1
+    return reordered
+
+
 def build_context(chunks: list[dict]) -> str:
     parts = []
-    for c in chunks:
+    for c in reorder_lost_in_middle(chunks):
         parts.append(f"[{c['source']}] ({c['heading_path']})\n{c['text']}")
     return "\n\n---\n\n".join(parts)
 
