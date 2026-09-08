@@ -64,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", type=int, default=None, help="Last chunk index to process (exclusive); default = end of corpus")
     parser.add_argument("--checkpoint", type=str, default=str(DEFAULT_CHECKPOINT_PATH), help="Path to this worker's checkpoint file")
     parser.add_argument("--api-key-env", type=str, default="GEMINI_API_KEY_EMBED", help="Env var name holding the API key to use")
+    parser.add_argument(
+        "--context-file", type=str, default=None,
+        help="Path to a chunk_contexts.json (from contextualize_chunks.py) - when given, each chunk's "
+             "LLM-generated context is prepended before embedding (Anthropic's Contextual Retrieval). "
+             "Point payloads still store the original, uncontextualized text.",
+    )
     return parser.parse_args()
 
 
@@ -104,19 +110,21 @@ def ensure_collection(qdrant: QdrantClient, want_fresh_start: bool) -> None:
         )
 
 
-def make_batches(chunks: list, start_index: int, end_index: int) -> list[tuple[int, list]]:
-    """Group chunks[start_index:end_index] into (start_offset, batch) pairs, each
-    batch capped at CHAR_BUDGET_PER_BATCH total characters (at least one chunk per
-    batch, even if that single chunk alone exceeds the budget)."""
+def make_batches(embed_texts: list[str], start_index: int, end_index: int) -> list[tuple[int, list[int]]]:
+    """Group indices [start_index, end_index) into (start_offset, batch_of_indices)
+    pairs, each batch capped at CHAR_BUDGET_PER_BATCH total characters of embed_texts
+    (at least one chunk per batch, even if that single chunk alone exceeds the
+    budget). Batching by embed_texts length (not the original chunk text) so a
+    contextualized chunk's extra prepended text still counts toward the budget."""
     batches = []
     i = start_index
     while i < end_index:
-        batch = [chunks[i]]
-        total_chars = len(chunks[i].text)
+        batch = [i]
+        total_chars = len(embed_texts[i])
         j = i + 1
-        while j < end_index and total_chars + len(chunks[j].text) <= CHAR_BUDGET_PER_BATCH:
-            batch.append(chunks[j])
-            total_chars += len(chunks[j].text)
+        while j < end_index and total_chars + len(embed_texts[j]) <= CHAR_BUDGET_PER_BATCH:
+            batch.append(j)
+            total_chars += len(embed_texts[j])
             j += 1
         batches.append((i, batch))
         i = j
@@ -160,6 +168,16 @@ def main() -> None:
     range_end = args.end if args.end is not None else len(chunks)
     print(f"Loaded {len(chunks)} chunks total; this worker handles [{args.start}, {range_end})")
 
+    contexts: dict[str, str] = {}
+    if args.context_file:
+        contexts = json.loads(Path(args.context_file).read_text(encoding="utf-8"))
+        missing = sum(1 for i in range(len(chunks)) if str(i) not in contexts)
+        print(f"Loaded {len(contexts)} chunk contexts from {args.context_file} ({missing} chunks have no context yet)")
+    embed_texts = [
+        f"{contexts[str(i)]}\n\n{c.text}" if str(i) in contexts else c.text
+        for i, c in enumerate(chunks)
+    ]
+
     start_index = load_checkpoint(checkpoint_path, args.start)
     genai_client, qdrant_client = get_clients(args.api_key_env)
     ensure_collection(qdrant_client, want_fresh_start=(args.start == 0 and start_index == 0))
@@ -171,26 +189,27 @@ def main() -> None:
         print("This worker's range is already fully indexed - nothing to do.")
         return
 
-    batches = make_batches(chunks, start_index, range_end)
+    batches = make_batches(embed_texts, start_index, range_end)
 
     try:
-        for offset, batch in tqdm(batches, desc="Embedding + upserting"):
-            vectors = embed_batch(genai_client, [c.text for c in batch])
+        for offset, indices in tqdm(batches, desc="Embedding + upserting"):
+            vectors = embed_batch(genai_client, [embed_texts[i] for i in indices])
             points = [
                 PointStruct(
-                    id=offset + j,
+                    id=i,
                     vector=vec,
                     payload={
-                        "text": c.text,
-                        "source": c.source,
-                        "kind": c.kind,
-                        "heading_path": c.heading_path,
+                        "text": chunks[i].text,
+                        "source": chunks[i].source,
+                        "kind": chunks[i].kind,
+                        "heading_path": chunks[i].heading_path,
+                        "context": contexts.get(str(i), ""),
                     },
                 )
-                for j, (c, vec) in enumerate(zip(batch, vectors))
+                for i, vec in zip(indices, vectors)
             ]
             qdrant_client.upsert(collection_name=COLLECTION, points=points)
-            save_checkpoint(checkpoint_path, offset + len(batch))
+            save_checkpoint(checkpoint_path, offset + len(indices))
             time.sleep(REQUEST_PACING_SECONDS)
     except ClientError as e:
         if e.code == 429:
