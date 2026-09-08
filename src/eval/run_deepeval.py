@@ -22,6 +22,7 @@ asyncio.gather regardless of async_config (that setting only paces *between* tes
 cases), which alone blows through the also-tight per-minute cap. So metrics are
 measured one at a time here, synchronously, with explicit pacing.
 """
+import argparse
 import json
 import os
 import sys
@@ -70,7 +71,7 @@ JUDGE_MODEL_CANDIDATES = [
 ]
 
 
-def build_metrics_with_available_judge(probe_client: genai.Client, remaining_candidates: list[str]):
+def build_metrics_with_available_judge(probe_client: genai.Client, remaining_candidates: list[str], api_key: str):
     """Pop exhausted/unavailable models off the front of remaining_candidates until
     one responds, and build the metrics list against it. Returns None if every
     candidate is exhausted."""
@@ -85,7 +86,7 @@ def build_metrics_with_available_judge(probe_client: genai.Client, remaining_can
                 continue
             raise
         print(f"Using judge model: {model}")
-        judge = GeminiModel(model=model, api_key=os.environ["GEMINI_API_KEY"])
+        judge = GeminiModel(model=model, api_key=api_key)
         return [
             FaithfulnessMetric(threshold=0.7, model=judge),
             AnswerRelevancyMetric(threshold=0.7, model=judge),
@@ -99,10 +100,20 @@ def load_golden() -> list[dict]:
     return json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
 
 
-def load_existing_report() -> list[dict]:
-    if REPORT_PATH.exists():
-        return json.loads(REPORT_PATH.read_text(encoding="utf-8"))
+def load_report(path: Path) -> list[dict]:
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
     return []
+
+
+def load_all_scored_questions(report_path: Path) -> set[str]:
+    """Union of what's already scored in the main report and (if different)
+    this shard's own report - so parallel shards don't waste quota rescoring
+    an example another shard (or a previous unsharded run) already did."""
+    scored = {entry["input"] for entry in load_report(REPORT_PATH)}
+    if report_path != REPORT_PATH:
+        scored |= {entry["input"] for entry in load_report(report_path)}
+    return scored
 
 
 def next_unscored_batch(golden: list[dict], already_scored: set[str], batch_size: int) -> list[dict]:
@@ -115,7 +126,7 @@ def run_pipeline_with_backoff(pipeline: RAGPipeline, question: str):
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         try:
             return pipeline.run(question)
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             if attempt < RATE_LIMIT_RETRIES:
                 print(f"  network error ({e}), sleeping 30s before retry...")
                 time.sleep(30)
@@ -143,7 +154,7 @@ def measure_with_backoff(metric, test_case: LLMTestCase) -> None:
                 print("  request timed out, retrying...")
                 continue
             raise
-        except httpx.ConnectError as e:
+        except httpx.TransportError as e:
             if attempt < RATE_LIMIT_RETRIES:
                 print(f"  network error ({e}), sleeping 30s before retry...")
                 time.sleep(30)
@@ -151,22 +162,35 @@ def measure_with_backoff(metric, test_case: LLMTestCase) -> None:
             raise
 
 
-def main(batch_size: int = 2) -> None:
-    golden = load_golden()
-    existing_report = load_existing_report()
-    already_scored = {entry["input"] for entry in existing_report}
+def main(
+    batch_size: int = 2,
+    api_key_env: str = "GEMINI_API_KEY",
+    report_path: Path = REPORT_PATH,
+    start: int = 0,
+    end: int | None = None,
+) -> None:
+    golden = load_golden()[start:end]
+    already_scored = load_all_scored_questions(report_path)
+    existing_report = load_report(report_path)
 
     batch = next_unscored_batch(golden, already_scored, batch_size)
     if not batch:
-        print(f"All {len(golden)} golden examples already scored - nothing to do.")
+        print(f"All {len(golden)} golden examples in this shard's range already scored - nothing to do.")
         return
 
-    pipeline = RAGPipeline()
+    pipeline = RAGPipeline(generator_api_key_env=api_key_env)
     print(f"Running pipeline over {len(batch)} new golden examples "
-          f"({len(already_scored)}/{len(golden)} already scored so far)...")
+          f"({len(already_scored)} already scored across all shards so far, "
+          f"{len(golden)} in this shard's range)...")
     test_cases = []
     for item in batch:
-        result = run_pipeline_with_backoff(pipeline, item["question"])
+        try:
+            result = run_pipeline_with_backoff(pipeline, item["question"])
+        except RuntimeError:
+            # All candidate generation models exhausted for this account today
+            # (see Generator._pick_model) - nothing left to do this run.
+            print("All candidate generation models exhausted or unavailable for today.")
+            sys.exit(1)
         test_cases.append(
             LLMTestCase(
                 input=item["question"],
@@ -176,15 +200,16 @@ def main(batch_size: int = 2) -> None:
             )
         )
 
-    probe_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    api_key = os.environ.get(api_key_env, os.environ["GEMINI_API_KEY"])
+    probe_client = genai.Client(api_key=api_key)
     remaining_candidates = list(JUDGE_MODEL_CANDIDATES)
-    metrics = build_metrics_with_available_judge(probe_client, remaining_candidates)
+    metrics = build_metrics_with_available_judge(probe_client, remaining_candidates, api_key)
     if metrics is None:
         print("All candidate judge models exhausted or unavailable for today.")
         sys.exit(1)
 
     report = existing_report
-    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     for i, test_case in enumerate(test_cases):
         print(f"Scoring test case {i + 1}/{len(test_cases)}: {test_case.input[:60]!r}")
         while True:
@@ -216,10 +241,10 @@ def main(batch_size: int = 2) -> None:
                     # stopping the whole run over one exhausted model.
                     print(f"  judge model exhausted ({e.code}), switching candidates...")
                     remaining_candidates.pop(0)
-                    metrics = build_metrics_with_available_judge(probe_client, remaining_candidates)
+                    metrics = build_metrics_with_available_judge(probe_client, remaining_candidates, api_key)
                     if metrics is None:
                         print("All candidate judge models exhausted or unavailable for today.")
-                        REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
                         sys.exit(1)
                     continue
                 # Some other API error - record it as an error entry so this
@@ -235,11 +260,23 @@ def main(batch_size: int = 2) -> None:
                 break
         # Save after every test case, not just at the end - a later test case
         # hitting the daily quota wall shouldn't lose already-scored results.
-        REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    print(f"\nSaved eval report -> {REPORT_PATH} ({len(report)}/{len(golden)} total scored)")
+    print(f"\nSaved eval report -> {report_path} ({len(report)} total scored in this shard's file)")
 
 
 if __name__ == "__main__":
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-    main(batch_size=n)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("batch_size", type=int, nargs="?", default=2)
+    parser.add_argument("--api-key-env", type=str, default="GEMINI_API_KEY", help="Env var name holding the generation/judge API key to use")
+    parser.add_argument("--report-path", type=str, default=str(REPORT_PATH), help="Where this shard writes its scored results (default: the shared eval_report.json)")
+    parser.add_argument("--start", type=int, default=0, help="First golden-example index this shard handles (inclusive)")
+    parser.add_argument("--end", type=int, default=None, help="Last golden-example index this shard handles (exclusive); default = end of dataset")
+    parsed = parser.parse_args()
+    main(
+        batch_size=parsed.batch_size,
+        api_key_env=parsed.api_key_env,
+        report_path=Path(parsed.report_path),
+        start=parsed.start,
+        end=parsed.end,
+    )

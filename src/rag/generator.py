@@ -40,8 +40,8 @@ def build_context(chunks: list[dict]) -> str:
 
 
 class Generator:
-    def __init__(self) -> None:
-        self.client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    def __init__(self, api_key_env: str = "GEMINI_API_KEY") -> None:
+        self.client = genai.Client(api_key=os.environ.get(api_key_env, os.environ["GEMINI_API_KEY"]))
         self.remaining_candidates = list(GEN_MODEL_CANDIDATES)
         self.model = None  # picked lazily on first generate() call
 

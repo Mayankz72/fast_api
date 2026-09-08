@@ -12,9 +12,9 @@ class RAGResult:
 
 
 class RAGPipeline:
-    def __init__(self, top_k: int = 5) -> None:
+    def __init__(self, top_k: int = 5, generator_api_key_env: str = "GEMINI_API_KEY") -> None:
         self.retriever = Retriever()
-        self.generator = Generator()
+        self.generator = Generator(api_key_env=generator_api_key_env)
         self.top_k = top_k
 
     def run(self, question: str) -> RAGResult:
