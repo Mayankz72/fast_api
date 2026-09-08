@@ -31,6 +31,12 @@ from pathlib import Path
 
 import httpx
 
+# Golden questions are scraped from GitHub Discussions and can contain
+# non-cp1252 characters (e.g. full-width punctuation); Windows' console
+# defaults stdout to cp1252, which raises UnicodeEncodeError on print().
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # Some judge responses (larger retrieval contexts) exceed DeepEval's default ~88s
 # per-attempt timeout - must be set before deepeval reads its settings.
 os.environ.setdefault("DEEPEVAL_PER_ATTEMPT_TIMEOUT_SECONDS_OVERRIDE", "180")
