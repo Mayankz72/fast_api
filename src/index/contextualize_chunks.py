@@ -189,6 +189,15 @@ def main(max_calls: int, api_key_env: str) -> None:
         except RuntimeError:
             print("All candidate generation models exhausted or unavailable for today.")
             break
+        except Exception as e:
+            # Not a quota/exhaustion signal - some other persistent failure (e.g.
+            # the model kept returning the wrong count after every retry). Skip
+            # this batch rather than crashing the whole run; it's not marked done,
+            # so a later invocation will simply try it again.
+            print(f"  giving up on this batch after retries ({e}), skipping...")
+            made += 1
+            time.sleep(REQUEST_PACING_SECONDS)
+            continue
         for i, ctx in zip(indices, new_contexts):
             contexts[str(i)] = ctx
         save_contexts(contexts)
