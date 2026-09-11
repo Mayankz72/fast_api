@@ -9,3 +9,4 @@ qdrant_storage/
 .pytest_cache/
 *.egg-info/
 .deepeval/
+*.log
