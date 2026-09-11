@@ -134,11 +134,21 @@ def next_unscored_batch(golden: list[dict], already_scored: set[str], batch_size
 
 
 def run_pipeline_with_backoff(pipeline: RAGPipeline, question: str):
-    """A brief internet blip shouldn't kill an unattended run - retry a few times
-    on transient network failures before giving up."""
+    """A brief internet blip or transient API error shouldn't kill an unattended
+    run - retry a few times before giving up. Covers the retriever's query-time
+    embedding call too (google.genai.errors.APIError, 429/503 - previously
+    uncaught here even though measure_with_backoff already handles the same
+    errors for the judge call; a bare 503 from embed_query crashed the whole
+    batch subprocess, wasting a supervisor retry cycle - see PROGRESS.md)."""
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         try:
             return pipeline.run(question)
+        except APIError as e:
+            if e.code in (429, 503) and attempt < RATE_LIMIT_RETRIES:
+                print(f"  {e.code} error retrieving/generating, sleeping {RATE_LIMIT_BACKOFF_SECONDS}s before retry...")
+                time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+                continue
+            raise
         except httpx.TransportError as e:
             if attempt < RATE_LIMIT_RETRIES:
                 print(f"  network error ({e}), sleeping 30s before retry...")
