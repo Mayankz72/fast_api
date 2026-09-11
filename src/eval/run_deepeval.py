@@ -51,6 +51,7 @@ from deepeval.models import GeminiModel
 from deepeval.test_case import LLMTestCase
 from google import genai
 from google.genai.errors import APIError
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rag.pipeline import RAGPipeline  # noqa: E402
@@ -139,7 +140,13 @@ def run_pipeline_with_backoff(pipeline: RAGPipeline, question: str):
     embedding call too (google.genai.errors.APIError, 429/503 - previously
     uncaught here even though measure_with_backoff already handles the same
     errors for the judge call; a bare 503 from embed_query crashed the whole
-    batch subprocess, wasting a supervisor retry cycle - see PROGRESS.md)."""
+    batch subprocess, wasting a supervisor retry cycle - see PROGRESS.md).
+    Also retries Qdrant 500s (qdrant_client.http.exceptions.UnexpectedResponse) -
+    hit repeatedly during the v3 reranking ablation (RERANK_FETCH_K=20, a larger
+    limit than v1/v2 ever used) as a server-side panic ("OffsetZero" unwrap) that
+    v1/v2's smaller top_k=5 queries never triggered; a fresh retry has recovered
+    every time observed, consistent with a transient/concurrency bug rather than
+    a deterministically-corrupt point."""
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         try:
             return pipeline.run(question)
@@ -147,6 +154,12 @@ def run_pipeline_with_backoff(pipeline: RAGPipeline, question: str):
             if e.code in (429, 503) and attempt < RATE_LIMIT_RETRIES:
                 print(f"  {e.code} error retrieving/generating, sleeping {RATE_LIMIT_BACKOFF_SECONDS}s before retry...")
                 time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+                continue
+            raise
+        except UnexpectedResponse as e:
+            if e.status_code == 500 and attempt < RATE_LIMIT_RETRIES:
+                print(f"  Qdrant 500 error, sleeping 10s before retry...")
+                time.sleep(10)
                 continue
             raise
         except httpx.TransportError as e:
