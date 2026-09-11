@@ -24,7 +24,21 @@ writeup/README ("built on X technique from Y paper" reads a lot better than
 
 ## Practical techniques worth adopting
 
-- **[Anthropic — Contextual Retrieval](https://www.anthropic.com/engineering/contextual-retrieval)** — prepends a short LLM-generated summary of "where this chunk sits in the document" to each chunk before embedding/BM25 indexing. Reported **49% reduction in failed retrievals**, 67% when combined with reranking. **This is a concrete, cheap upgrade for `src/ingest/chunk.py`** — worth doing as a v2 experiment and comparing DeepEval scores before/after (turns it into an actual ablation study for the resume writeup).
+- **[Anthropic — Contextual Retrieval](https://www.anthropic.com/engineering/contextual-retrieval)** — prepends a short LLM-generated summary of "where this chunk sits in the document" to each chunk before embedding/BM25 indexing. Reported **49% reduction in failed retrievals**, 67% when combined with reranking. **Implemented and ablated (2026-09-11)** — see the results table below. Directionally consistent with Anthropic's finding (retrieval metrics improved most), though at much smaller magnitude on this corpus/dataset.
+
+### Ablation result: Contextual Retrieval (v1 vs v2)
+
+Same 437-example golden set (GitHub Discussions Q&A), same generation/judge models, only the index changed: v1 embeds raw chunk text (`fastapi_corpus`), v2 prepends an LLM-generated context blurb per chunk before embedding (`fastapi_corpus_contextual`, via `src/index/contextualize_chunks.py` + `embed_and_index.py --context-file`).
+
+| Metric | v1 (no context) | v2 (Contextual Retrieval) | Δ (relative) |
+|---|---|---|---|
+| Faithfulness | 0.949 (92.9% pass) | 0.958 (93.7% pass) | +0.009 (+0.9%) |
+| Answer Relevancy | 0.771 (68.7% pass) | 0.809 (71.7% pass) | +0.038 (+4.9%) |
+| Contextual Precision | 0.231 (17.6% pass) | 0.262 (20.8% pass) | +0.031 (+13.4%) |
+| Contextual Recall | 0.128 (6.4% pass) | 0.147 (8.6% pass) | +0.019 (+14.8%) |
+| All-4-metrics-pass | 2.4% (10/425) | 3.5% (15/428) | +1.1pp |
+
+The two retrieval-specific metrics (Precision/Recall) moved the most in relative terms, as expected since Contextual Retrieval targets retrieval quality specifically — generation metrics (Faithfulness/Relevancy) improved too, likely a secondary effect of slightly better-targeted context reaching the generator. Retrieval quality remains the dominant bottleneck even after the improvement (both metrics still under 30% pass rate) — see PROGRESS.md's next steps for what to try next (reranking, chunk size sweep).
 - **[Lost in the Middle: How Language Models Use Long Contexts](https://arxiv.org/abs/2307.03172)** (Liu et al., 2023) — LLMs attend more to the start/end of context than the middle. Implication for us: when `top_k` context chunks are stuffed into the prompt in `generator.py`, ordering matters — most-relevant chunks should be placed at the start *and* end, not buried in the middle. Another concrete, citable improvement.
 
 ## How this maps to our build
@@ -34,7 +48,7 @@ writeup/README ("built on X technique from Y paper" reads a lot better than
 | Lewis et al. (RAG) | `src/rag/pipeline.py` — the whole retrieve→generate structure |
 | Karpukhin et al. (DPR) | `src/rag/retriever.py` — dense embedding retrieval via Qdrant |
 | RAGAS metrics | `src/eval/run_deepeval.py` — Faithfulness/AnswerRelevancy/ContextualPrecision/ContextualRecall |
-| Anthropic Contextual Retrieval | **Not yet implemented** — planned v2 improvement to `src/ingest/chunk.py` |
+| Anthropic Contextual Retrieval | **Implemented and ablated** — `src/index/contextualize_chunks.py`, `fastapi_corpus_contextual` collection, results above |
 | Lost in the Middle | **Not yet implemented** — planned reordering fix in `src/rag/generator.py`'s `build_context()` |
 | AutoRAG-style config search | **Stretch goal** — sweep chunk size / top_k and pick best by eval score |
 
