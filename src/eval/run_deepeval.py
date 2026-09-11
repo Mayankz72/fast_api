@@ -226,6 +226,10 @@ def main(
     print(f"Running pipeline over {len(batch)} new golden examples "
           f"({len(already_scored)} already scored across all shards so far, "
           f"{len(golden)} in this shard's range)...")
+
+    report = existing_report
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
     test_cases = []
     for item in batch:
         try:
@@ -235,6 +239,19 @@ def main(
             # (see Generator._pick_model) - nothing left to do this run.
             print("All candidate generation models exhausted or unavailable for today.")
             sys.exit(1)
+        except Exception as e:
+            # A single question shouldn't cost the rest of the batch - e.g. a
+            # deterministic per-query Qdrant panic ("OffsetZero" unwrap, hit
+            # during the v3 reranking run) survives every retry and previously
+            # crashed this whole loop, discarding the other already-completed
+            # questions' generation work (wasted quota) and re-triggering on
+            # every relaunch since the poison question was never marked scored.
+            # Recording it as an error entry (same as the scoring loop below)
+            # means it's skipped on future runs, same as any other error.
+            print(f"  error retrieving/generating for this question, skipping: {e}")
+            report.append({"input": item["question"], "success": False, "error": str(e)})
+            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            continue
         test_cases.append(
             LLMTestCase(
                 input=item["question"],
@@ -244,6 +261,10 @@ def main(
             )
         )
 
+    if not test_cases:
+        print("Every question in this batch failed during retrieval/generation - nothing to score.")
+        return
+
     api_key = os.environ.get(api_key_env, os.environ["GEMINI_API_KEY"])
     probe_client = genai.Client(api_key=api_key)
     remaining_candidates = list(JUDGE_MODEL_CANDIDATES)
@@ -252,8 +273,6 @@ def main(
         print("All candidate judge models exhausted or unavailable for today.")
         sys.exit(1)
 
-    report = existing_report
-    report_path.parent.mkdir(parents=True, exist_ok=True)
     for i, test_case in enumerate(test_cases):
         print(f"Scoring test case {i + 1}/{len(test_cases)}: {test_case.input[:60]!r}")
         while True:
