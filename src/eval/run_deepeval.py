@@ -112,11 +112,18 @@ def load_report(path: Path) -> list[dict]:
     return []
 
 
-def load_all_scored_questions(report_path: Path) -> set[str]:
+def load_all_scored_questions(report_path: Path, check_shared_report: bool = True) -> set[str]:
     """Union of what's already scored in the main report and (if different)
     this shard's own report - so parallel shards don't waste quota rescoring
-    an example another shard (or a previous unsharded run) already did."""
-    scored = {entry["input"] for entry in load_report(REPORT_PATH)}
+    an example another shard (or a previous unsharded run) already did.
+
+    Set check_shared_report=False for an independent comparison run (e.g. scoring
+    the same golden set against a different index/collection for an ablation) -
+    otherwise every question looks "already scored" via the main report and
+    nothing runs."""
+    scored: set[str] = set()
+    if check_shared_report:
+        scored |= {entry["input"] for entry in load_report(REPORT_PATH)}
     if report_path != REPORT_PATH:
         scored |= {entry["input"] for entry in load_report(report_path)}
     return scored
@@ -174,9 +181,10 @@ def main(
     report_path: Path = REPORT_PATH,
     start: int = 0,
     end: int | None = None,
+    check_shared_report: bool = True,
 ) -> None:
     golden = load_golden()[start:end]
-    already_scored = load_all_scored_questions(report_path)
+    already_scored = load_all_scored_questions(report_path, check_shared_report=check_shared_report)
     existing_report = load_report(report_path)
 
     batch = next_unscored_batch(golden, already_scored, batch_size)
@@ -278,6 +286,7 @@ if __name__ == "__main__":
     parser.add_argument("--report-path", type=str, default=str(REPORT_PATH), help="Where this shard writes its scored results (default: the shared eval_report.json)")
     parser.add_argument("--start", type=int, default=0, help="First golden-example index this shard handles (inclusive)")
     parser.add_argument("--end", type=int, default=None, help="Last golden-example index this shard handles (exclusive); default = end of dataset")
+    parser.add_argument("--independent-run", action="store_true", help="Score against a separate collection/backend for an ablation comparison - don't skip questions already scored in the shared eval_report.json")
     parsed = parser.parse_args()
     main(
         batch_size=parsed.batch_size,
@@ -285,4 +294,5 @@ if __name__ == "__main__":
         report_path=Path(parsed.report_path),
         start=parsed.start,
         end=parsed.end,
+        check_shared_report=not parsed.independent_run,
     )
