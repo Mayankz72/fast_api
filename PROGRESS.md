@@ -126,7 +126,7 @@ demo. See `README.md` for the pitch and setup instructions.
 1. ~~Let the v2 eval run finish~~ - **done, see above.**
 2. ~~Compare v1 vs v2 and write up the ablation~~ - **done, see RESOURCES.md.**
 3. Consider a retrieval-quality follow-up now that Contextual Retrieval alone didn't close the gap: reranking (ColBERT-style late interaction, per RESOURCES.md) is the most directly-motivated next experiment given Contextual Precision/Recall are still the weak point.
-4. Harden `embed_and_index.py` to also retry on `google.genai.errors.ServerError` (503), matching the existing `httpx.TransportError` retry - avoids needing an external supervisor loop next time a run needs resuming.
+4. ~~Harden `embed_and_index.py` to also retry on `google.genai.errors.ServerError` (503)~~ - **done (2026-09-11)**, matches the existing `httpx.TransportError` retry pattern.
 5. `fastapi_corpus` (v1, Gemini embeddings, no context) is fully indexed alongside `fastapi_corpus_local` - re-run the eval with `EMBED_BACKEND=gemini` on that (non-contextual) collection too and compare local-vs-Gemini embedding quality as a bonus ablation, lower priority
 6. Wire up Phoenix tracing for a debugging demo
 7. Stretch: AutoRAG-style sweep over chunk size/top_k picked by eval score; CI workflow running `run_deepeval.py` as a regression gate; deploy the FastAPI app

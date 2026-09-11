@@ -35,7 +35,7 @@ import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from google.genai.errors import ClientError
+from google.genai.errors import ClientError, ServerError
 from google.genai.types import HttpOptions, HttpRetryOptions
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
@@ -136,7 +136,11 @@ def embed_batch(genai_client: genai.Client, texts: list[str]) -> list[list[float
     window and retry a few times rather than hammering it with exponential backoff
     (which just burns more of the same per-minute quota). Also retries on transient
     network/DNS failures (httpx.TransportError - covers ConnectError, ConnectTimeout,
-    ReadTimeout, etc.) - an internet blip shouldn't kill a multi-hour unattended job."""
+    ReadTimeout, etc.) and transient server-side errors (google.genai.errors.ServerError,
+    e.g. 503 UNAVAILABLE - previously uncaught, which crashed unattended workers and
+    needed an external supervisor loop to relaunch from checkpoint; see PROGRESS.md
+    2026-09-10) - an internet blip or a brief model outage shouldn't kill a
+    multi-hour unattended job."""
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         try:
             resp = genai_client.models.embed_content(
@@ -149,6 +153,12 @@ def embed_batch(genai_client: genai.Client, texts: list[str]) -> list[list[float
             if e.code == 429 and attempt < RATE_LIMIT_RETRIES:
                 print(f"\nRate limited, sleeping {RATE_LIMIT_BACKOFF_SECONDS}s before retry...")
                 time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+                continue
+            raise
+        except ServerError as e:
+            if attempt < RATE_LIMIT_RETRIES:
+                print(f"\nServer error ({e.code}), sleeping 30s before retry...")
+                time.sleep(30)
                 continue
             raise
         except httpx.TransportError as e:
