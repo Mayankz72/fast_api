@@ -134,6 +134,15 @@ def next_unscored_batch(golden: list[dict], already_scored: set[str], batch_size
     return [item for item in golden if item["question"] not in already_scored][:batch_size]
 
 
+def is_transient_api_error(code: int) -> bool:
+    """429 = quota/rate limit, 5xx = server-side (503 overload, 502 bad gateway,
+    etc.) - all worth backing off and retrying rather than crashing. Started as
+    a hardcoded (429, 503) tuple; a live run hit an uncaught 502 that tuple
+    missed, so this generalizes to "any 5xx" instead of enumerating codes one
+    crash at a time."""
+    return code == 429 or code >= 500
+
+
 def run_pipeline_with_backoff(pipeline: RAGPipeline, question: str):
     """A brief internet blip or transient API error shouldn't kill an unattended
     run - retry a few times before giving up. Covers the retriever's query-time
@@ -151,7 +160,7 @@ def run_pipeline_with_backoff(pipeline: RAGPipeline, question: str):
         try:
             return pipeline.run(question)
         except APIError as e:
-            if e.code in (429, 503) and attempt < RATE_LIMIT_RETRIES:
+            if is_transient_api_error(e.code) and attempt < RATE_LIMIT_RETRIES:
                 print(f"  {e.code} error retrieving/generating, sleeping {RATE_LIMIT_BACKOFF_SECONDS}s before retry...")
                 time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
                 continue
@@ -176,9 +185,7 @@ def measure_with_backoff(metric, test_case: LLMTestCase) -> None:
             metric.measure(test_case, _show_indicator=False)
             return
         except APIError as e:
-            # 429 = quota/rate limit, 503 = transient model overload - both worth
-            # backing off and retrying rather than crashing the whole run.
-            if e.code in (429, 503) and attempt < RATE_LIMIT_RETRIES:
+            if is_transient_api_error(e.code) and attempt < RATE_LIMIT_RETRIES:
                 print(f"  {e.code} error, sleeping {RATE_LIMIT_BACKOFF_SECONDS}s before retry...")
                 time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
                 continue
@@ -272,7 +279,7 @@ def main(
                 )
                 break
             except APIError as e:
-                if e.code in (429, 503):
+                if is_transient_api_error(e.code):
                     # This judge model is done for today - swap to the next
                     # candidate and retry this same example, rather than
                     # stopping the whole run over one exhausted model.
