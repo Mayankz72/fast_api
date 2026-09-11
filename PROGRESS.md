@@ -121,11 +121,17 @@ demo. See `README.md` for the pitch and setup instructions.
 - **Final v2 result (428/437 with metrics, 9 recorded as `"error"` entries):** Faithfulness avg **0.958** (93.7% pass @0.7), Answer Relevancy avg **0.809** (71.7% pass), Contextual Precision avg **0.262** (20.8% pass), Contextual Recall avg **0.147** (8.6% pass). All-4-metrics-pass rate: **3.5%** (15/428).
 - **v1 -> v2 ablation (Contextual Retrieval): every metric improved**, with the two retrieval-specific metrics moving the most in relative terms (Contextual Precision +13.4%, Contextual Recall +14.8%) - consistent with Anthropic's finding that Contextual Retrieval targets retrieval quality specifically, though at much smaller magnitude on this corpus/dataset than their reported ~49% failed-retrieval reduction. Full comparison table in RESOURCES.md. Retrieval quality is still the dominant bottleneck (both metrics under 30% pass rate) even after the improvement.
 
+## Current state (as of 2026-09-11, later same day)
+
+- **Added an optional cross-encoder reranking stage to `src/rag/retriever.py`** (`USE_RERANKER=true`), the retrieval-quality follow-up flagged in next steps below. Over-fetches `RERANK_FETCH_K=20` candidates by embedding similarity, rescores each `(query, chunk)` pair jointly with a small local cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`, via `sentence-transformers` - already a dependency, no new package needed), returns the top_k by that score. Local/free, so it doesn't compete with the Gemini free-tier quota the eval loop is bottlenecked on. Off by default - existing v1/v2 baselines are unaffected; opt in via the env var, same pattern as `EMBED_BACKEND`.
+  - Smoke-tested against `EMBED_BACKEND=local` - correct, grounded, sourced answer; reranked source ordering looked sensible on manual inspection.
+  - **Not yet run against the full golden set.** Next step is a v3 DeepEval ablation (`USE_RERANKER=true` on top of the v2 contextual index) to see whether it actually moves Contextual Precision/Recall, following the same pattern as the v1->v2 comparison (separate report path, `--independent-run`).
+
 ## Next steps
 
 1. ~~Let the v2 eval run finish~~ - **done, see above.**
 2. ~~Compare v1 vs v2 and write up the ablation~~ - **done, see RESOURCES.md.**
-3. Consider a retrieval-quality follow-up now that Contextual Retrieval alone didn't close the gap: reranking (ColBERT-style late interaction, per RESOURCES.md) is the most directly-motivated next experiment given Contextual Precision/Recall are still the weak point.
+3. ~~Add a reranking stage~~ - **implemented (2026-09-11), see above.** Still need to: run the v3 eval ablation (`USE_RERANKER=true`) against the golden set and write up v2->v3 in RESOURCES.md, same pattern as v1->v2.
 4. ~~Harden `embed_and_index.py` to also retry on `google.genai.errors.ServerError` (503)~~ - **done (2026-09-11)**, matches the existing `httpx.TransportError` retry pattern.
 5. `fastapi_corpus` (v1, Gemini embeddings, no context) is fully indexed alongside `fastapi_corpus_local` - re-run the eval with `EMBED_BACKEND=gemini` on that (non-contextual) collection too and compare local-vs-Gemini embedding quality as a bonus ablation, lower priority
 6. Wire up Phoenix tracing for a debugging demo
