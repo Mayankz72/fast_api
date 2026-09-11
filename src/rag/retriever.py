@@ -6,6 +6,16 @@ Supports two embedding backends, selected by the EMBED_BACKEND env var:
 
 Use "local" while the Gemini free-tier indexing job (slow, rate-limited) is still
 catching up, or to avoid API calls entirely.
+
+Optional cross-encoder reranking stage, enabled via USE_RERANKER=true: over-fetches
+RERANK_FETCH_K candidates by embedding similarity, then rescores each (query, chunk)
+pair with a small local cross-encoder and returns the top_k by that score instead.
+Cross-encoders attend to the query and chunk jointly (unlike the bi-encoder embedding
+similarity used for the initial fetch), which is more accurate but too slow to run
+over the whole corpus - hence retrieve-then-rerank rather than rerank-everything.
+Local/free (no API quota spent) since Contextual Precision/Recall were still the
+weak point after Contextual Retrieval (see RESOURCES.md ablation) and this doesn't
+compete with the free-tier Gemini quota the rest of the pipeline is bottlenecked on.
 """
 import os
 
@@ -26,6 +36,10 @@ LOCAL_COLLECTION = os.environ.get("QDRANT_COLLECTION_LOCAL", "fastapi_corpus_loc
 # get no prefix (see embed_and_index_local.py).
 LOCAL_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
+USE_RERANKER = os.environ.get("USE_RERANKER", "false").lower() == "true"
+RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_FETCH_K = int(os.environ.get("RERANK_FETCH_K", "20"))
+
 
 class Retriever:
     def __init__(self) -> None:
@@ -45,6 +59,12 @@ class Retriever:
             )
             self._embed_config = types.EmbedContentConfig(task_type="RETRIEVAL_QUERY")
 
+        self.reranker = None
+        if USE_RERANKER:
+            from sentence_transformers import CrossEncoder
+
+            self.reranker = CrossEncoder(RERANK_MODEL_NAME)
+
     def embed_query(self, query: str) -> list[float]:
         if EMBED_BACKEND == "local":
             vec = self.local_model.encode(LOCAL_QUERY_PREFIX + query, normalize_embeddings=True)
@@ -55,11 +75,12 @@ class Retriever:
         return resp.embeddings[0].values
 
     def retrieve(self, query: str, top_k: int = 5) -> list[dict]:
+        fetch_k = RERANK_FETCH_K if self.reranker else top_k
         vector = self.embed_query(query)
         hits = self.qdrant.query_points(
-            collection_name=self.collection, query=vector, limit=top_k
+            collection_name=self.collection, query=vector, limit=fetch_k
         ).points
-        return [
+        candidates = [
             {
                 "text": h.payload["text"],
                 "source": h.payload["source"],
@@ -69,3 +90,11 @@ class Retriever:
             }
             for h in hits
         ]
+        if self.reranker and candidates:
+            pairs = [(query, c["text"]) for c in candidates]
+            rerank_scores = self.reranker.predict(pairs)
+            for c, s in zip(candidates, rerank_scores):
+                c["score"] = float(s)
+            candidates.sort(key=lambda c: c["score"], reverse=True)
+            candidates = candidates[:top_k]
+        return candidates
