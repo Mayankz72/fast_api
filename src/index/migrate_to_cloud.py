@@ -1,7 +1,7 @@
 """One-off migration: copy an existing local Qdrant collection's points to a
 Qdrant Cloud cluster, for deploying the app somewhere the local Docker Qdrant
-isn't reachable from. Scrolls + upserts the already-embedded points directly -
-no re-embedding, so this costs no Gemini API quota.
+isn't reachable from. Reads the already-embedded points directly - no
+re-embedding, so this costs no Gemini API quota.
 
 Usage:
     python -m src.index.migrate_to_cloud --collection fastapi_corpus_contextual
@@ -11,62 +11,107 @@ QDRANT_CLOUD_API_KEY (kept separate from QDRANT_URL/QDRANT_API_KEY, which the
 app itself reads at request time, so this script's source is always "whatever
 local Qdrant docker-compose is running" regardless of what the app is
 currently pointed at).
+
+Point IDs are the corpus chunk's absolute index (0..total-1) - see
+embed_and_index.py - which is what makes the payload-reconstruction fallback
+below possible: chunk_corpus() deterministically regenerates the exact same
+chunk text/source/kind/heading_path from data/raw, so a corrupted payload can
+be rebuilt from scratch rather than lost.
 """
 import argparse
+import json
 import os
+import sys
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ingest.chunk import chunk_corpus  # noqa: E402
+
 load_dotenv()
 
 LOCAL_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 CLOUD_URL = os.environ.get("QDRANT_CLOUD_URL")
 CLOUD_API_KEY = os.environ.get("QDRANT_CLOUD_API_KEY")
+CONTEXT_FILE = Path(__file__).resolve().parents[2] / "data" / "processed" / "chunk_contexts.json"
 
 BATCH_SIZE = 100
-RETRIEVE_RETRIES = 8
-BATCH_PACING_SECONDS = 0.5
+RETRIEVE_RETRIES = 5
 
 
-def retrieve_with_backoff(source: QdrantClient, collection: str, ids: list[int]):
-    """Both scroll()'s offset pagination and retrieve() hit the same server-side
-    panic ("OffsetZero" unwrap - the same bug class as the RERANK_FETCH_K=20
-    retrieval panics in run_deepeval.py, see PROGRESS.md/RESOURCES.md). Manual
-    probing showed it's not tied to a specific corrupt point - the identical ID
-    range succeeds or fails depending on batch size and which flags
-    (with_payload/with_vectors) are combined, and got worse the more rapid-fire
-    requests were fired at the container - consistent with local Docker Qdrant
-    getting resource-starved (each point here carries a 3072-dim float vector,
-    ~12KB) under back-to-back large-batch reads rather than one corrupt point.
-    Retries with real backoff (not just a flat 2s) give the container room to
-    recover; if a batch still won't go through, halve it and retry each half -
-    this must terminate successfully at size 1 (a single point's data isn't
-    inherently corrupt, confirmed by manual spot checks), so never silently
-    drop points - just keep retrying smaller/slower."""
+class ReconstructPayload:
+    """Lazily regenerates chunk text/source/kind/heading_path + context from
+    data/raw + chunk_contexts.json, matching embed_and_index.py's payload
+    schema exactly - used only for points whose stored payload is corrupted
+    (confirmed on this collection: point 522's payload panics the server on
+    every fetch, even alone, while its vector fetches fine - a genuine
+    single-point storage corruption, not a transient/resource issue)."""
+
+    def __init__(self) -> None:
+        self._chunks = None
+        self._contexts = None
+
+    def _ensure_loaded(self) -> None:
+        if self._chunks is not None:
+            return
+        root = Path(__file__).resolve().parents[2] / "data" / "raw"
+        self._chunks = chunk_corpus(root / "docs", root / "code")
+        self._contexts = json.loads(CONTEXT_FILE.read_text(encoding="utf-8")) if CONTEXT_FILE.exists() else {}
+
+    def get(self, index: int) -> dict:
+        self._ensure_loaded()
+        c = self._chunks[index]
+        return {
+            "text": c.text,
+            "source": c.source,
+            "kind": c.kind,
+            "heading_path": c.heading_path,
+            "context": self._contexts.get(str(index), ""),
+        }
+
+
+def fetch_point(source: QdrantClient, collection: str, point_id: int, reconstruct: ReconstructPayload) -> PointStruct:
+    """Fetch one point with retries; if its payload is corrupted server-side
+    (fetching with payload panics even alone, but vector-only succeeds),
+    rebuild the payload from source instead of giving up or dropping it."""
     for attempt in range(RETRIEVE_RETRIES + 1):
         try:
-            return source.retrieve(
-                collection_name=collection, ids=ids, with_payload=True, with_vectors=True
-            )
+            (record,) = source.retrieve(collection_name=collection, ids=[point_id], with_payload=True, with_vectors=True)
+            return PointStruct(id=record.id, vector=record.vector, payload=record.payload)
         except UnexpectedResponse as e:
             if e.status_code != 500:
                 raise
             if attempt < RETRIEVE_RETRIES:
                 time.sleep(2 * (attempt + 1))
                 continue
-            if len(ids) > 1:
-                mid = len(ids) // 2
-                print(f"  batch of {len(ids)} ({ids[0]}-{ids[-1]}) still failing after retries, splitting in half...")
-                time.sleep(3)
-                left = retrieve_with_backoff(source, collection, ids[:mid])
-                time.sleep(3)
-                right = retrieve_with_backoff(source, collection, ids[mid:])
-                return left + right
-            raise
+            print(f"  point {point_id}: payload fetch panics server-side, reconstructing payload from source instead")
+            (record,) = source.retrieve(collection_name=collection, ids=[point_id], with_payload=False, with_vectors=True)
+            return PointStruct(id=record.id, vector=record.vector, payload=reconstruct.get(point_id))
+
+
+def fetch_batch(source: QdrantClient, collection: str, ids: list[int], reconstruct: ReconstructPayload) -> list[PointStruct]:
+    """Try the whole batch at once (fast path); if the server panics on it
+    (qdrant_client.http.exceptions.UnexpectedResponse, the "OffsetZero" bug -
+    see PROGRESS.md/RESOURCES.md for the same panic hit during the v3 eval
+    run), fall back to fetching this batch one point at a time so a single
+    corrupted point doesn't block the other 99 in its batch."""
+    for attempt in range(RETRIEVE_RETRIES + 1):
+        try:
+            records = source.retrieve(collection_name=collection, ids=ids, with_payload=True, with_vectors=True)
+            return [PointStruct(id=r.id, vector=r.vector, payload=r.payload) for r in records]
+        except UnexpectedResponse as e:
+            if e.status_code != 500:
+                raise
+            if attempt < RETRIEVE_RETRIES:
+                time.sleep(2 * (attempt + 1))
+                continue
+            print(f"  batch {ids[0]}-{ids[-1]} still failing after retries, falling back to per-point fetch...")
+            return [fetch_point(source, collection, i, reconstruct) for i in ids]
 
 
 def main() -> None:
@@ -79,6 +124,7 @@ def main() -> None:
 
     source = QdrantClient(url=LOCAL_URL)
     dest = QdrantClient(url=CLOUD_URL, api_key=CLOUD_API_KEY)
+    reconstruct = ReconstructPayload()
 
     if not source.collection_exists(args.collection):
         raise SystemExit(f"Source collection '{args.collection}' not found at {LOCAL_URL}")
@@ -102,23 +148,16 @@ def main() -> None:
         print(f"Destination already has {already}/{total} points - nothing to do.")
         return
 
-    # Point IDs are the corpus chunk's absolute index (0..total-1) - see
-    # embed_and_index.py. Batching over this known range (rather than
-    # scroll()'s offset pagination) sidesteps the OffsetZero panic entirely.
     # upsert() is idempotent by ID, so re-sending already-migrated batches on a
-    # rerun is harmless - not worth the extra complexity of tracking a resume
-    # point for a collection this size.
+    # rerun is harmless - not worth tracking a resume point for a collection
+    # this size.
     migrated = 0
     for start in range(0, total, BATCH_SIZE):
         batch_ids = list(range(start, min(start + BATCH_SIZE, total)))
-        points = retrieve_with_backoff(source, args.collection, batch_ids)
-        if not points:
-            continue
-        upsert_points = [PointStruct(id=p.id, vector=p.vector, payload=p.payload) for p in points]
-        dest.upsert(collection_name=args.collection, points=upsert_points)
+        points = fetch_batch(source, args.collection, batch_ids, reconstruct)
+        dest.upsert(collection_name=args.collection, points=points)
         migrated += len(points)
         print(f"  migrated {migrated}/{total}")
-        time.sleep(BATCH_PACING_SECONDS)
 
     final = dest.count(args.collection).count
     print(f"Done. Destination now has {final} points.")
