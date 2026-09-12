@@ -37,6 +37,39 @@ evaluation set and automated metrics (faithfulness, answer relevancy, contextual
 precision/recall) so retrieval and generation quality can be measured and improved
 with actual numbers, not vibes.
 
+## Results
+
+Every change below was measured against the same 437-example golden set (real
+GitHub Discussions Q&A, not synthetic) and the same generation/judge models -
+only the retrieval technique changed between rows. Full methodology, per-example
+analysis, and citations in [`RESOURCES.md`](RESOURCES.md).
+
+| | Faithfulness | Answer Relevancy | Contextual Precision | Contextual Recall | All 4 pass |
+|---|---|---|---|---|---|
+| v1 - raw chunks | 0.949 | 0.771 | 0.231 | 0.128 | 2.4% |
+| v2 - + [Contextual Retrieval](https://www.anthropic.com/engineering/contextual-retrieval) | 0.958 | 0.809 | 0.262 | 0.147 | 3.5% |
+| v3 - + cross-encoder reranking | 0.958 | 0.791 | 0.258 | 0.153 | 3.5% |
+
+- **Contextual Retrieval (v1 -> v2) was a clear, reproducible win** across every
+  metric, largest (relatively) on the two retrieval-specific ones - consistent
+  with Anthropic's published finding, at smaller magnitude on this corpus.
+- **Reranking (v2 -> v3) looked like a wash in aggregate, but wasn't** - it's a
+  ceiling effect. Per-example analysis (417 questions, both runs) found 71% of
+  scores moved by more than 0.2 points; reranking improved already-poor
+  retrievals (+0.129 avg where the initial ranking scored < 0.3) but hurt
+  already-good ones (-0.377 avg where it scored > 0.7), and the two roughly
+  cancel out in the mean. That's the kind of thing an aggregate metric alone
+  would hide - and the reason this project measures per-example, not just
+  averages.
+- Retrieval quality (Contextual Precision/Recall) remains the dominant
+  bottleneck throughout, even after both improvements - generation quality
+  (Faithfulness) was never the weak point.
+
+Shipped past the notebook stage too: [live on Render](https://fastapi-docs-rag.onrender.com)
+against a Qdrant Cloud index, with a [CI regression gate](#ci-eval-regression-gate)
+that scores a fixed sample on every retrieval/generation change and a
+[Phoenix tracing](#pipeline) integration for debugging live requests.
+
 ## Setup
 
 ```bash
