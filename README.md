@@ -8,6 +8,10 @@ a golden dataset built from real, answered GitHub Discussions.
 `gemini-3.5-flash-lite` generation, free tier) · DeepEval (metrics/CI) ·
 Arize Phoenix (tracing) · FastAPI (serving)
 
+**Live demo:** https://fastapi-docs-rag.onrender.com/query (POST `{"question": "..."}`) -
+deployed on Render's free tier, so the first request after a period of inactivity
+takes ~30-60s to wake up. `/health` for a quick liveness check.
+
 See [`PROGRESS.md`](PROGRESS.md) for the build log and [`RESOURCES.md`](RESOURCES.md)
 for the research papers and techniques this design is based on.
 
