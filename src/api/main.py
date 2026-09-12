@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from ..eval.phoenix_tracing import start_tracing
 from ..rag.pipeline import RAGPipeline
+
+start_tracing()
 
 app = FastAPI(title="FastAPI Docs RAG")
 pipeline = RAGPipeline()

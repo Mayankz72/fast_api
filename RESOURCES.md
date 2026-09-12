@@ -39,6 +39,32 @@ Same 437-example golden set (GitHub Discussions Q&A), same generation/judge mode
 | All-4-metrics-pass | 2.4% (10/425) | 3.5% (15/428) | +1.1pp |
 
 The two retrieval-specific metrics (Precision/Recall) moved the most in relative terms, as expected since Contextual Retrieval targets retrieval quality specifically — generation metrics (Faithfulness/Relevancy) improved too, likely a secondary effect of slightly better-targeted context reaching the generator. Retrieval quality remains the dominant bottleneck even after the improvement (both metrics still under 30% pass rate) — see PROGRESS.md's next steps for what to try next (reranking, chunk size sweep).
+
+### Ablation result: cross-encoder reranking (v2 vs v3)
+
+Same 437-example golden set and v2 contextual index (`fastapi_corpus_contextual`); v3 adds a reranking stage on top (`USE_RERANKER=true` in `src/rag/retriever.py`) — over-fetches `RERANK_FETCH_K=20` candidates by embedding similarity, then rescores each `(query, chunk)` pair jointly with a local cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) and keeps the top 5.
+
+| Metric | v2 (Contextual Retrieval) | v3 (+ reranking) | Δ (relative) |
+|---|---|---|---|
+| Faithfulness | 0.958 (93.7% pass) | 0.958 (92.5% pass) | +0.000 (+0.0%) |
+| Answer Relevancy | 0.809 (71.7% pass) | 0.791 (67.8% pass) | -0.018 (-2.2%) |
+| Contextual Precision | 0.262 (20.8% pass) | 0.258 (20.5% pass) | -0.004 (-1.5%) |
+| Contextual Recall | 0.147 (8.6% pass) | 0.153 (8.0% pass) | +0.006 (+4.1%) |
+| All-4-metrics-pass | 3.5% (15/428) | 3.5% (15/425) | +0.0pp |
+
+**The aggregate looks like a null result, but it isn't — it's cancellation.** Per-example score deltas (417 questions with real scores on both sides, matched by question text) tell a much more specific story than the averages above: reranking substantially moved most individual scores, just in offsetting directions. **71% of questions moved by more than 0.2 total across the 4 metrics** (in either direction), and for Contextual Precision specifically, 24.7% of questions improved by >0.05 while a nearly-equal 21.8% got worse by >0.05 — only 53.5% were roughly unchanged.
+
+Bucketing by each question's **v2 (pre-reranking) Contextual Precision baseline** exposes exactly why the gains and losses cancel: reranking helps low-baseline questions and hurts high-baseline ones, in a clear, monotonic pattern —
+
+| v2 baseline Contextual Precision | n | avg Δ from reranking |
+|---|---|---|
+| low (< 0.3) | 277 | **+0.129** |
+| mid (0.3 - 0.7) | 56 | -0.061 |
+| high (> 0.7) | 84 | **-0.377** |
+
+When the embedding-similarity retriever already ranked the right chunks first (v2 baseline > 0.7), the cross-encoder reranker frequently *displaces* the correct top result with a plausible-but-wrong one - a ceiling effect, since there's little room to improve and real room to break something that already worked. When the baseline ranking was poor (< 0.3), the reranker's independent (query, chunk) scoring rescues a meaningful fraction of those failures. Since most of this golden set's questions sit in the low-baseline bucket (277/417 - consistent with Contextual Precision's low ~20% pass rate overall), the aggregate mean should read as a net positive; it doesn't, because the high-baseline bucket's losses are individually much larger in magnitude (-0.377 vs +0.129) even though there are fewer of them (84 vs 277) - a smaller number of bigger regressions offsetting a larger number of smaller gains.
+
+**Practical implication:** a conditional reranking policy (only rerank when initial retrieval confidence is low, e.g. skip reranking above some embedding-similarity-score threshold) would plausibly capture the low-baseline gains while avoiding the high-baseline regressions - a concrete, testable follow-up rather than "reranking doesn't work here." Not implemented (would need a fourth ablation run against judge quota); flagged as a stretch goal below.
 - **[Lost in the Middle: How Language Models Use Long Contexts](https://arxiv.org/abs/2307.03172)** (Liu et al., 2023) — LLMs attend more to the start/end of context than the middle. Implication for us: when `top_k` context chunks are stuffed into the prompt in `generator.py`, ordering matters — most-relevant chunks should be placed at the start *and* end, not buried in the middle. Another concrete, citable improvement.
 
 ## How this maps to our build
@@ -49,7 +75,8 @@ The two retrieval-specific metrics (Precision/Recall) moved the most in relative
 | Karpukhin et al. (DPR) | `src/rag/retriever.py` — dense embedding retrieval via Qdrant |
 | RAGAS metrics | `src/eval/run_deepeval.py` — Faithfulness/AnswerRelevancy/ContextualPrecision/ContextualRecall |
 | Anthropic Contextual Retrieval | **Implemented and ablated** — `src/index/contextualize_chunks.py`, `fastapi_corpus_contextual` collection, results above |
-| Lost in the Middle | **Not yet implemented** — planned reordering fix in `src/rag/generator.py`'s `build_context()` |
+| Cross-encoder reranking | **Implemented and ablated (helps/hurts by baseline confidence, cancels out in aggregate)** — `src/rag/retriever.py` (`USE_RERANKER=true`), results above |
+| Lost in the Middle | **Implemented** — `reorder_lost_in_middle()` in `src/rag/generator.py`, not separately re-scored (see PROGRESS.md) |
 | AutoRAG-style config search | **Stretch goal** — sweep chunk size / top_k and pick best by eval score |
 
 Sources: [Lewis et al., RAG](https://arxiv.org/abs/2005.11401) · [Karpukhin et al., DPR](https://arxiv.org/abs/2004.04906) · [Khattab & Zaharia, ColBERT](https://arxiv.org/abs/2004.12832) · [Es et al., RAGAS](https://arxiv.org/abs/2309.15217) · [Saad-Falcon et al., ARES](https://arxiv.org/abs/2311.09476) · [RAGChecker](https://arxiv.org/abs/2408.08067) · [AutoRAG](https://arxiv.org/abs/2410.20878) · [Gao et al., RAG Survey](https://arxiv.org/abs/2312.10997) · [Anthropic, Contextual Retrieval](https://www.anthropic.com/engineering/contextual-retrieval) · [Liu et al., Lost in the Middle](https://arxiv.org/abs/2307.03172)
