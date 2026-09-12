@@ -1,12 +1,3 @@
----
-title: FastAPI Docs RAG
-emoji: 📚
-colorFrom: green
-colorTo: blue
-sdk: docker
-app_port: 7860
----
-
 # FastAPI Docs RAG — with an evaluation harness
 
 A RAG system that answers questions about FastAPI (docs + source code), with an
