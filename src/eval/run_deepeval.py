@@ -51,7 +51,7 @@ from deepeval.models import GeminiModel
 from deepeval.test_case import LLMTestCase
 from google import genai
 from google.genai.errors import APIError
-from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from rag.pipeline import RAGPipeline  # noqa: E402
@@ -155,7 +155,19 @@ def run_pipeline_with_backoff(pipeline: RAGPipeline, question: str):
     limit than v1/v2 ever used) as a server-side panic ("OffsetZero" unwrap) that
     v1/v2's smaller top_k=5 queries never triggered; a fresh retry has recovered
     every time observed, consistent with a transient/concurrency bug rather than
-    a deterministically-corrupt point."""
+    a deterministically-corrupt point.
+
+    Also retries qdrant_client.http.exceptions.ResponseHandlingException - raised
+    when Qdrant is unreachable at all (e.g. Docker Desktop wasn't running), not
+    just when it responds with an error. This is a *different* exception type
+    than UnexpectedResponse/httpx.TransportError (it wraps a raw socket-level
+    OSError, "WinError 10061 connection refused" on Windows) and previously fell
+    through to the generic per-question handler in main(), which permanently
+    records the question as a dead "error" entry with no retry. During the v3
+    run this silently poisoned 302/437 questions when Qdrant was down for an
+    extended stretch - the supervisor kept "completing" batches in seconds
+    because every question failed instantly instead of getting backed off and
+    retried. See PROGRESS.md."""
     for attempt in range(RATE_LIMIT_RETRIES + 1):
         try:
             return pipeline.run(question)
@@ -169,6 +181,12 @@ def run_pipeline_with_backoff(pipeline: RAGPipeline, question: str):
             if e.status_code == 500 and attempt < RATE_LIMIT_RETRIES:
                 print(f"  Qdrant 500 error, sleeping 10s before retry...")
                 time.sleep(10)
+                continue
+            raise
+        except ResponseHandlingException as e:
+            if attempt < RATE_LIMIT_RETRIES:
+                print(f"  Qdrant unreachable ({e}), sleeping 30s before retry...")
+                time.sleep(30)
                 continue
             raise
         except httpx.TransportError as e:
