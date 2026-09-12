@@ -8,12 +8,26 @@ a golden dataset built from real, answered GitHub Discussions.
 `gemini-3.5-flash-lite` generation, free tier) · DeepEval (metrics/CI) ·
 Arize Phoenix (tracing) · FastAPI (serving)
 
-**Live demo:** https://fastapi-docs-rag.onrender.com/query (POST `{"question": "..."}`) -
-deployed on Render's free tier, so the first request after a period of inactivity
-takes ~30-60s to wake up. `/health` for a quick liveness check.
-
 See [`PROGRESS.md`](PROGRESS.md) for the build log and [`RESOURCES.md`](RESOURCES.md)
 for the research papers and techniques this design is based on.
+
+## Try the live demo
+
+**https://fastapi-docs-rag.onrender.com** redirects to an interactive Swagger UI -
+expand **POST /query**, click **"Try it out"**, edit the request body, click
+**"Execute"**. Or from a terminal:
+
+```bash
+curl -X POST https://fastapi-docs-rag.onrender.com/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "How do I add a query parameter with a default value?"}'
+```
+
+Deployed on Render's free tier (spins down after inactivity - the first request
+after a lull takes ~30-60s to wake up) against a Qdrant Cloud free-tier cluster
+holding the Contextual-Retrieval-indexed corpus (`fastapi_corpus_contextual`,
+see the ablation in `RESOURCES.md`). `GET /health` for a quick liveness check
+that doesn't spend any Gemini API quota.
 
 ## Why this project
 
@@ -58,6 +72,30 @@ python src/eval/phoenix_tracing.py    # UI at http://localhost:6006
 # 7. Serve the API
 uvicorn src.api.main:app --reload
 ```
+
+## Deployment
+
+The live demo above runs as a Docker container on Render, reading from a Qdrant
+Cloud cluster instead of local Docker Qdrant. To redeploy elsewhere:
+
+```bash
+# 1. Copy an already-indexed local collection to Qdrant Cloud (no re-embedding)
+#    - set QDRANT_CLOUD_URL / QDRANT_CLOUD_API_KEY in .env first
+python -m src.index.migrate_to_cloud --collection fastapi_corpus_contextual
+
+# 2. Build and smoke-test the image locally
+docker build -t fastapi-rag .
+docker run -p 7860:7860 --env-file .env \
+  -e QDRANT_URL=$QDRANT_CLOUD_URL -e QDRANT_API_KEY=$QDRANT_CLOUD_API_KEY \
+  fastapi-rag
+
+# 3. Push to a host that builds from the Dockerfile (Render, Fly.io, etc.),
+#    setting GEMINI_API_KEY, QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION,
+#    and EMBED_BACKEND=gemini as that host's environment variables/secrets.
+```
+
+The Dockerfile binds to `$PORT` if set (Render's convention), falling back to
+7860 (Hugging Face Spaces' convention) otherwise - adjust for other hosts.
 
 ## Design decisions worth calling out (for the writeup)
 
