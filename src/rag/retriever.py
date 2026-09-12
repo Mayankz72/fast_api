@@ -26,6 +26,7 @@ load_dotenv()
 
 EMBED_BACKEND = os.environ.get("EMBED_BACKEND", "gemini")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")  # required for Qdrant Cloud, unset for local Docker
 
 GEMINI_MODEL = "gemini-embedding-001"
 GEMINI_COLLECTION = os.environ.get("QDRANT_COLLECTION", "fastapi_corpus")
@@ -43,7 +44,7 @@ RERANK_FETCH_K = int(os.environ.get("RERANK_FETCH_K", "20"))
 
 class Retriever:
     def __init__(self) -> None:
-        self.qdrant = QdrantClient(url=QDRANT_URL)
+        self.qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
         if EMBED_BACKEND == "local":
             from sentence_transformers import SentenceTransformer
 

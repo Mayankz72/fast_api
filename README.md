@@ -1,11 +1,21 @@
+---
+title: FastAPI Docs RAG
+emoji: 📚
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 7860
+---
+
 # FastAPI Docs RAG — with an evaluation harness
 
 A RAG system that answers questions about FastAPI (docs + source code), with an
 automated evaluation harness measuring retrieval and generation quality against
 a golden dataset built from real, answered GitHub Discussions.
 
-**Stack:** Qdrant (vector store) · OpenAI (`text-embedding-3-small` + `gpt-4o-mini`) ·
-DeepEval (metrics/CI) · Arize Phoenix (tracing) · FastAPI (serving)
+**Stack:** Qdrant (vector store) · Google Gemini (`gemini-embedding-001` embeddings +
+`gemini-3.5-flash-lite` generation, free tier) · DeepEval (metrics/CI) ·
+Arize Phoenix (tracing) · FastAPI (serving)
 
 See [`PROGRESS.md`](PROGRESS.md) for the build log and [`RESOURCES.md`](RESOURCES.md)
 for the research papers and techniques this design is based on.
@@ -24,7 +34,7 @@ with actual numbers, not vibes.
 python -m venv .venv
 .venv/Scripts/activate        # or source .venv/bin/activate on macOS/Linux
 pip install -r requirements.txt
-cp .env.example .env          # fill in OPENAI_API_KEY and (optionally) GITHUB_TOKEN
+cp .env.example .env          # fill in GEMINI_API_KEY and (optionally) GITHUB_TOKEN
 docker compose up -d          # starts Qdrant on localhost:6333
 ```
 
