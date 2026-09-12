@@ -103,8 +103,8 @@ def build_metrics_with_available_judge(probe_client: genai.Client, remaining_can
     return None
 
 
-def load_golden() -> list[dict]:
-    return json.loads(GOLDEN_PATH.read_text(encoding="utf-8"))
+def load_golden(dataset_path: Path = GOLDEN_PATH) -> list[dict]:
+    return json.loads(dataset_path.read_text(encoding="utf-8"))
 
 
 def load_report(path: Path) -> list[dict]:
@@ -230,8 +230,9 @@ def main(
     start: int = 0,
     end: int | None = None,
     check_shared_report: bool = True,
+    dataset_path: Path = GOLDEN_PATH,
 ) -> None:
-    golden = load_golden()[start:end]
+    golden = load_golden(dataset_path)[start:end]
     already_scored = load_all_scored_questions(report_path, check_shared_report=check_shared_report)
     existing_report = load_report(report_path)
 
@@ -354,6 +355,7 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, default=0, help="First golden-example index this shard handles (inclusive)")
     parser.add_argument("--end", type=int, default=None, help="Last golden-example index this shard handles (exclusive); default = end of dataset")
     parser.add_argument("--independent-run", action="store_true", help="Score against a separate collection/backend for an ablation comparison - don't skip questions already scored in the shared eval_report.json")
+    parser.add_argument("--dataset-file", type=str, default=str(GOLDEN_PATH), help="Golden dataset JSON to score against (default: the full fetched-from-Discussions set)")
     parsed = parser.parse_args()
     main(
         batch_size=parsed.batch_size,
@@ -362,4 +364,5 @@ if __name__ == "__main__":
         start=parsed.start,
         end=parsed.end,
         check_shared_report=not parsed.independent_run,
+        dataset_path=Path(parsed.dataset_file),
     )

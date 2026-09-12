@@ -97,6 +97,19 @@ docker run -p 7860:7860 --env-file .env \
 The Dockerfile binds to `$PORT` if set (Render's convention), falling back to
 7860 (Hugging Face Spaces' convention) otherwise - adjust for other hosts.
 
+## CI: eval regression gate
+
+`.github/workflows/eval-regression.yml` runs `src/eval/check_regression.py` on
+every push to `main` that touches retrieval/generation/indexing code (or on
+manual dispatch) - scores a small fixed 5-question subset of the golden
+dataset (`tests/fixtures/`) against production's Qdrant Cloud index, and fails
+the build if any metric drops more than a noise-tolerant threshold from the
+checked-in v2 baseline. Deliberately not a full 437-example run - see the
+script's docstring for why (free-tier Gemini quota, judge-model noise).
+
+Requires these repo secrets (**Settings -> Secrets and variables -> Actions**):
+`GEMINI_API_KEY`, `QDRANT_URL` (the Qdrant Cloud cluster URL), `QDRANT_API_KEY`.
+
 ## Design decisions worth calling out (for the writeup)
 
 - **Chunking is content-aware, not fixed-size.** Markdown docs are split on

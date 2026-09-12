@@ -159,6 +159,14 @@ demo. See `README.md` for the pitch and setup instructions.
 - **Deploy succeeded first try**: polled the Render API from `build_in_progress` -> `update_in_progress` -> `live` (~4.5 min total, mostly the ~3.3GB image build). **Live and verified**: https://fastapi-docs-rag.onrender.com - hit `/health` and `POST /query` on the actual public URL, got a correct, grounded, sourced answer back, sourced from the migrated Qdrant Cloud collection. Free tier spins down after inactivity (~30-60s cold start on the next request) - noted in README.
 - **Deployment stretch goal (step 7) done.** Full chain end to end: GitHub repo -> Render (Docker) -> Qdrant Cloud, zero paid services, zero re-embedding cost for the migration.
 
+## Current state (as of 2026-09-12, CI regression gate)
+
+- **Added a CI eval regression gate** (`.github/workflows/eval-regression.yml`, step 7's CI stretch goal). Runs `src/eval/check_regression.py` on push to `main` (paths: `src/rag/**`, `run_deepeval.py`, `check_regression.py`, `src/index/**`, `requirements.txt`) or manual dispatch.
+- **Deliberately a small fixed subset, not a full run**: the free-tier Gemini quota that gated this entire project can't support scoring 437 examples on every push. `tests/fixtures/ci_regression_set.json` holds 5 golden examples that scored cleanly (no judge errors) in the v2 Contextual Retrieval baseline, with their exact per-metric scores checked into `tests/fixtures/ci_baseline_scores.json`. The gate re-scores just those 5 against production's actual Qdrant Cloud index and fails if any metric's average delta drops more than 0.20 (a tolerance wide enough to absorb the judge-model noise already documented throughout this project - malformed JSON, occasional off-scores on an otherwise-fine answer - while still catching a real break, e.g. a chunking change that collapses Contextual Precision/Recall toward 0).
+- Added a `--dataset-file` option to `run_deepeval.py` (defaults to the full golden set, unchanged behavior) so `check_regression.py` could point it at the small fixture instead of needing to regenerate/commit the full 437-example dataset.
+- **Verified locally end-to-end** against the real Qdrant Cloud collection before wiring into CI: all 5 questions scored, Faithfulness dipped -0.100 (within the 0.20 tolerance), the other 3 metrics unchanged - correctly printed PASS, exit code 0.
+- **Needs the user to add 3 repo secrets** before the workflow can actually run (`GEMINI_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`, values same as `.env`'s Gemini key and the Qdrant Cloud cluster) - not done via API on purpose, secrets are exactly the kind of thing to leave to GitHub's own UI rather than push programmatically. See README's new "CI: eval regression gate" section for the exact path.
+
 ## Next steps
 
 1. ~~Let the v2 eval run finish~~ - **done, see above.**
@@ -169,4 +177,5 @@ demo. See `README.md` for the pitch and setup instructions.
 6. ~~Wire up Phoenix tracing for a debugging demo~~ - **done (2026-09-12)**, see above. Fixed a real bug (missing `sys.path` fix) and wired it into both the standalone script and the actual FastAPI app.
 7. ~~Per-example score-delta analysis for the v2->v3 result~~ - **done (2026-09-12)**, see above - found a ceiling-effect pattern (ties into stretch idea below).
 8. ~~Deploy the FastAPI app~~ - **done (2026-09-12)**, see above. Live at https://fastapi-docs-rag.onrender.com.
-9. Stretch: confidence-gated reranking (only rerank below some embedding-similarity threshold, per the ceiling-effect finding above) and re-ablate; AutoRAG-style sweep over chunk size/top_k picked by eval score; CI workflow running `run_deepeval.py` as a regression gate
+9. ~~CI workflow running `run_deepeval.py` as a regression gate~~ - **done (2026-09-12)**, see above. Blocked only on the user adding the 3 repo secrets.
+10. Stretch: confidence-gated reranking (only rerank below some embedding-similarity threshold, per the ceiling-effect finding above) and re-ablate; AutoRAG-style sweep over chunk size/top_k picked by eval score
